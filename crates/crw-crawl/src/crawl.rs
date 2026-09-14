@@ -249,8 +249,13 @@ async fn run_crawl_inner(opts: CrawlOptions<'_>) {
     // "" to reqwest::Proxy::all, which rejects it with "builder error"
     // (issue #154). A genuinely malformed non-empty value still fails closed below.
     .filter(|p| !p.trim().is_empty());
+    // Without these a seed host that blackholes `/robots.txt` hangs this fetch
+    // forever: the job holds one of the process-wide crawl permits and stays
+    // `InProgress` indefinitely, and non-terminal jobs are never TTL-evicted.
     let mut client_builder = reqwest::Client::builder()
         .user_agent(user_agent)
+        .timeout(ROBOTS_FETCH_TIMEOUT)
+        .connect_timeout(ROBOTS_CONNECT_TIMEOUT)
         .redirect(crw_core::url_safety::safe_redirect_policy());
     if let Some(ref proxy_url) = robots_proxy {
         match reqwest::Proxy::all(proxy_url) {
@@ -274,9 +279,21 @@ async fn run_crawl_inner(opts: CrawlOptions<'_>) {
         .expect("reqwest client build should not fail");
 
     let robots = if respect_robots {
-        RobotsTxt::fetch(&origin, &client)
-            .await
-            .unwrap_or_else(|_| RobotsTxt::parse(""))
+        // Fail-open is the existing product decision, but it must not be
+        // silent: with the timeouts above, a blackholed robots.txt now turns
+        // into "this site has no rules" after 15s instead of hanging, and an
+        // operator needs to be able to see that happen.
+        match RobotsTxt::fetch(&origin, &client).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    origin,
+                    error = %e,
+                    "robots.txt fetch failed; proceeding with no rules"
+                );
+                RobotsTxt::parse("")
+            }
+        }
     } else {
         RobotsTxt::parse("")
     };
@@ -679,6 +696,14 @@ pub struct DiscoverResult {
 /// is true, the BFS phase still runs but with a much smaller time budget
 /// (we have plenty already; spending the full timeout on slow HTML fetches
 /// would burn time for marginal gain).
+/// Read timeout for the one-shot `robots.txt` fetch. In `run_crawl` this is the
+/// only bound on that request: unlike `discover_urls`, `CrawlOptions` carries no
+/// overall deadline, and `deadline_ms_per_page` never reaches this call.
+const ROBOTS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Connect timeout for the `robots.txt` fetch.
+const ROBOTS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const SITEMAP_SUFFICIENT_THRESHOLD: usize = 50;
 /// Hard ceiling on the BFS crawl phase when sitemap was sufficient.
 const BFS_SHORT_BUDGET_SECS: u64 = 30;
@@ -857,8 +882,8 @@ pub async fn discover_urls(opts: DiscoverOptions<'_>) -> CrwResult<DiscoverResul
         .filter(|p| !p.trim().is_empty());
     let mut discover_client_builder = reqwest::Client::builder()
         .user_agent(user_agent)
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(ROBOTS_FETCH_TIMEOUT)
+        .connect_timeout(ROBOTS_CONNECT_TIMEOUT)
         .redirect(crw_core::url_safety::safe_redirect_policy());
     if let Some(ref proxy_url) = discover_proxy {
         let p = reqwest::Proxy::all(proxy_url).map_err(|e| {
