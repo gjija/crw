@@ -305,10 +305,27 @@ async fn run_crawl_inner(opts: CrawlOptions<'_>) {
             break;
         }
 
+        // Match on path *and* query. `is_allowed(url.path())` drops the query,
+        // which silently permits everything a site forbade with a `?` pattern —
+        // Hacker News disallows `/hide?`, `/vote?` and `/reply?`. The discovery
+        // path already gates with `is_url_allowed`; this one did not.
         if let Ok(parsed) = url::Url::parse(&url)
-            && !robots.is_allowed(parsed.path())
+            && !robots.is_url_allowed(&parsed)
         {
-            tracing::debug!(url, "Blocked by robots.txt");
+            if depth == 0 {
+                // The seed itself. Gating it otherwise yields a `Completed`,
+                // `success: true` crawl with zero pages and no error, which a
+                // caller cannot tell from "the site had nothing". Matching on
+                // the query makes this newly reachable for a common shape:
+                // `Disallow: /` + `Allow: /$` against a seed carrying a `utm_`
+                // parameter, which path-only matching used to let through.
+                tracing::warn!(
+                    url,
+                    "crawl seed is disallowed by robots.txt; the crawl will return no pages"
+                );
+            } else {
+                tracing::debug!(url, "Blocked by robots.txt");
+            }
             continue;
         }
 
